@@ -5,6 +5,12 @@ module Signal = struct
   let sigpipe_handler = Lwt_unix.on_signal Sys.sigpipe (fun _sig -> prerr_endline @@ "SIGPIPE")
 end
 
+module ListUtil = struct
+  let repeat e n =
+    let rec doit m = if m = 0 then [] else e :: doit (m - 1)
+    in doit n;;
+end
+
 module Default = struct
   (* Default map:
    *
@@ -69,7 +75,7 @@ module Settings = struct
 
   let offline = ref false
   let punter_file = ref None
-  let progs = ref ["eager-futures-splurges-options"; "eager-futures-splurges-options"]
+  let progs = ref (ListUtil.repeat "eager-futures-splurges-options" 16)
 
   (* extensions *)
   let splurges = ref false
@@ -853,6 +859,8 @@ module Json = struct
     let p = s |> member "punter" |> to_int in
     let score = s |> member "score" |> to_int in
     (p, score)
+  let output_full_score p score =
+    `Assoc [("punter", `Int p); ("score", `Int score); ("team", `String (List.nth !Settings.progs p))]
   let output_score p score =
     if !Settings.offline then
       `Assoc [("punter", `Int p); ("score", `Int score); ("team", `String (List.nth !Settings.progs p))]
@@ -866,6 +874,9 @@ module Json = struct
   let output_scores scores =
     let scores = Array.to_list scores in
     `Assoc [("scores", `List (List.mapi output_score scores))]
+  let output_full_scores scores =
+    let scores = Array.to_list scores in
+    `Assoc [("scores", `List (List.mapi output_full_score scores))]
 
   (* Future scores *)
   let output_future_scores future_scores =
@@ -1065,7 +1076,7 @@ end = struct
     (* sort the futures before logging *)
     let future_scores = Array.map (fun (_, xs) -> List.sort (fun (m, _) (m', _) -> m - m') xs) scores in
 
-    Log.json (Json.output_scores total_scores) >>= fun () ->
+    Log.json (Json.output_full_scores total_scores) >>= fun () ->
     begin
       if !Settings.futures then
         Log.json (Json.output_future_scores future_scores)
@@ -1883,6 +1894,8 @@ module OnlineServer : PCI with type init_data = unit = struct
   let socket_domain () = Lwt_unix.PF_INET
   let address () = Lwt_unix.ADDR_INET(Unix.inet_addr_of_string (!Settings.address), !Settings.port)
 
+  let list_set i e lst = List.mapi (fun ix el -> if(i == ix) then e else el) lst
+
   let backlog = 10
 
   let send c json =
@@ -1943,7 +1956,9 @@ module OnlineServer : PCI with type init_data = unit = struct
              Log.error (punter_prefix i^" requested malformed name: "^Json.json_to_string me) >>= fun () ->
              Log.error (msg) >>= fun () -> return "garbled name"
          end >>= fun name ->
-         Log.info ("New punter: " ^ name ^ ", with punter id: " ^ string_of_int i) >>= fun () ->
+         Log.info ("New punter: {\"name\": " ^ Json.json_to_string (`String name) ^ ", \"id\": " ^ string_of_int i ^ "}");
+         Log.json (`Assoc [("punter", `Int i); ("team", `String name)]);
+         Settings.progs := list_set i name !Settings.progs;
          send c (Json.output_you name) >>= fun () ->
          return (Punter, c))
       (fun e ->
@@ -1992,12 +2007,30 @@ module OnlineServer : PCI with type init_data = unit = struct
     in
     setup [] 0
 
+
+  let report_map game =
+    let map =
+      match !Settings.map_path with
+      | None -> "default.json"
+      | Some s -> Filename.basename s in
+    Log.info ("Map: "^map) >>= fun () ->
+    Log.info ("Number of sites: "^string_of_int (G.nb_vertex game.base)) >>= fun () ->
+    Log.info ("Number of rivers: "^string_of_int (G.nb_edges game.base)) >>= fun () ->
+    Log.info ("Number of mines: "^string_of_int (List.length game.mines)) >>= fun () ->
+    Log.json (`Assoc [("map", `String map)])
+
+  let report_settings settings =
+    Log.info ("Extensions: "^Game.string_of_settings settings) >>= fun () ->
+    Log.json (Json.output_settings settings)
+
   let go game scoring_data () start_game =
     Lwt_main.run
       begin
         Log.init () >>= fun () ->
+        let settings = read_settings () in
+        report_settings settings >>= fun () ->
+        report_map game >>= fun () ->
         Log.info ("Base score: " ^ string_of_int (Score.calc_total scoring_data (Game.empty_futures game.mines) game.base)) >>= fun () ->
-        Log.info ("Server settings: " ^ Game.string_of_settings (read_settings ())) >>= fun () ->
         create_socket () >>= fun sock ->
         (Repl.go game scoring_data <?> setup_game game scoring_data sock start_game)
       end
